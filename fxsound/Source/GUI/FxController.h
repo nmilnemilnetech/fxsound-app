@@ -31,6 +31,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "AudioPassthru.h"
 #include "DfxDsp.h"
 #include <wtsapi32.h>
+#include <atomic>
 
 using namespace FxSound;
 
@@ -238,6 +239,10 @@ private:
 	static constexpr UINT CMD_PREVIOUS_PRESET = 1004;
 	static constexpr UINT CMD_NEXT_OUTPUT = 1005;
 
+	// Posted to message_window_ so device-change handling runs on the message thread rather than
+	// on the Windows MMDevice notification thread that delivers the callback.
+	static constexpr UINT WM_FX_SOUND_DEVICE_CHANGE = WM_APP + 1;
+
 	FxController();
 
 	static LRESULT CALLBACK eventCallback(HWND hwnd, const UINT message, const WPARAM w_param, const LPARAM l_param);
@@ -323,6 +328,10 @@ private:
 	int max_user_presets_;
 
 	DWORD session_id_;
+
+	// Coalesces bursts of device notifications (a Bluetooth connect fires a dozen or more)
+	// into a single WM_FX_SOUND_DEVICE_CHANGE.
+	std::atomic<bool> device_change_pending_{ false };
 
 	CriticalSection lock_;
 	CriticalSection save_lock_;
