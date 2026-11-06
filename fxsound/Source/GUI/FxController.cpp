@@ -2014,6 +2014,16 @@ LRESULT CALLBACK FxController::eventCallback(HWND hwnd, const UINT message, cons
 	}
 	break;
 
+	case WM_FX_SOUND_DEVICE_CHANGE:
+	{
+		if (controller != nullptr)
+		{
+			controller->device_change_pending_ = false;
+			controller->onSoundDeviceChange(w_param != 0);
+		}
+		return 0;
+	}
+
 	case WM_POWERBROADCAST:
 	{
 		if (w_param == PBT_APMSUSPEND)
@@ -2120,6 +2130,18 @@ void FxController::onSoundDeviceChange(bool processing)
 {
 	if (session_id_ != WTSGetActiveConsoleSessionId())
 		return; // Ignore device changes on another user session
+
+	// Device notifications arrive on a Windows MMDevice thread. Handling them there meant
+	// re-entering the audio enumerator from inside its own callback, racing processTimer()'s
+	// sndDevicesReInit() over the same device tables, and updating JUCE UI off the message
+	// thread. Hand the work to the message thread instead and return immediately, as
+	// IMMNotificationClient callbacks are required to.
+	if (!MessageManager::existsAndIsCurrentThread())
+	{
+		if (!device_change_pending_.exchange(true))
+			PostMessage(message_window_.getHandle(), WM_FX_SOUND_DEVICE_CHANGE, (WPARAM)processing, 0);
+		return;
+	}
 
 	ScopedLock auto_lock(lock_);
 

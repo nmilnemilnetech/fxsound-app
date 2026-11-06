@@ -62,13 +62,20 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 	if (hp_sndDevices_ == NULL)
 		return;
 
-	/* If the processing thread is running, kill it */
-	if (killProcessingThread(&i_timed_out) != OKAY)
-		return;
+	/* Detach from device notifications first. Restoring the default device below fires
+	   OnDefaultDeviceChanged on the MMDevice thread; previously that re-entered FxController
+	   (which then queried this half-destroyed object and could touch the UI from that thread)
+	   while this thread was tearing down the same sndDevices state. */
+	s_callback_ = nullptr;
+	s_sndDevices_.deviceChangeCallback = NULL;
+	s_sndDevices_.ignoreDeviceCallbacks = TRUE;
 
-	/* If the killing of processing attempt timed out, then we can't do anything else */
-	if (i_timed_out)
-		return;
+	/* If the processing thread is running, kill it */
+	killProcessingThread(&i_timed_out);
+
+	/* Even if the thread didn't stop in time, still put the Windows default device back.
+	   Returning early here used to leave the FxSound virtual device as the system default
+	   after exit, i.e. no sound anywhere until FxSound was started again. */
 
 	/* Disable volume callbacks before switching devices to prevent the DFX driver's
 	   volume state reset from propagating to the real speakers during shutdown. */
@@ -87,6 +94,11 @@ AudioPassthruPrivate::~AudioPassthruPrivate()
 	SND_DEVICES_VIRTUAL_PLAYBACK_DFX, FALSE,  &i_result_flag) != OKAY)
 	return(NOT_OKAY);
 	*/
+
+	/* A processing thread that refused to die is still using the audio objects, so don't free
+	   them out from under it; the process is exiting anyway. */
+	if (i_timed_out)
+		return;
 
 	/* Free the data allocated inside the sndDevices_hdl (NOTE: Does not free up structure) */
 	if (sndDevicesFree(hp_sndDevices_) != OKAY)

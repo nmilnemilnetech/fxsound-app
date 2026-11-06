@@ -233,6 +233,15 @@ int PT_DECLSPEC sndDevicesFree(PT_HANDLE *hp_sndDevices)
 	if (cast_handle == NULL)
 		return(OKAY);
 
+	// Unregister device notifications BEFORE freeing anything. The callbacks read pwszID[] and the
+	// device arrays freed below, and the default-device restore done just before this call fires
+	// OnDefaultDeviceChanged; unregistering last let those callbacks run against freed memory.
+	cast_handle->deviceChangeCallback = NULL;
+	cast_handle->ignoreDeviceCallbacks = TRUE;
+	hr = CoCreateInstance(cast_handle->CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, cast_handle->IID_IMMDeviceEnumerator, (void**)&pEnumerator);
+	if (SUCCEEDED(hr) && pEnumerator != NULL)
+		pEnumerator->UnregisterEndpointNotificationCallback(&(cast_handle->DeviceEvents));
+
 	sndDevices_ReleaseAllAudioObjects(hp_sndDevices);
 
 	// PTNOTE - trying to do a smart close of these in process recording files was causing problems.
@@ -262,10 +271,6 @@ int PT_DECLSPEC sndDevicesFree(PT_HANDLE *hp_sndDevices)
 		if( cast_handle->fFilePlaybackBuf != NULL )
 			free( cast_handle->fFilePlaybackBuf );
 	}
-	
-	hr = CoCreateInstance(cast_handle->CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, cast_handle->IID_IMMDeviceEnumerator, (void**)&pEnumerator);
-
-	hr = pEnumerator->UnregisterEndpointNotificationCallback(&(cast_handle->DeviceEvents));
 
 	return(OKAY);
 }
