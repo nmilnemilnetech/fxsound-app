@@ -34,10 +34,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 sndDevicesHdlType AudioPassthruPrivate::s_sndDevices_;
 AudioPassthruCallback* AudioPassthruPrivate::s_callback_ = nullptr;
 
-// While processing is parked because the playback device was unavailable, retry this often
-// even if no further device notification arrives. Bluetooth endpoints in particular report
-// ACTIVE before their stream can actually be opened, and may send no further event once ready.
-#define DFXG_PARKED_RETRY_INTERVAL_MSECS 2000
+// While processing is parked because the playback device was unavailable, retry even if no
+// further device notification arrives: Bluetooth endpoints in particular report ACTIVE before
+// their stream can actually be opened, and may send no further event once ready. The interval
+// starts short and doubles on each fruitless retry up to the maximum, so a device that stays
+// away (e.g. a headset switched off for hours) costs one reinit a minute rather than reviving
+// the reinit storm fixed for #580. A device change resets it to the minimum.
+#define DFXG_PARKED_RETRY_MIN_INTERVAL_MSECS 2000
+#define DFXG_PARKED_RETRY_MAX_INTERVAL_MSECS 60000
 
 AudioPassthruPrivate::AudioPassthruPrivate()
 {
@@ -52,6 +56,7 @@ AudioPassthruPrivate::AudioPassthruPrivate()
 	mute_ = false;
 	reinit_generation_ = 0;
 	parked_since_ticks_ = 0;
+	parked_retry_interval_msecs_ = DFXG_PARKED_RETRY_MIN_INTERVAL_MSECS;
 }
 
 AudioPassthruPrivate::~AudioPassthruPrivate()
@@ -398,14 +403,24 @@ int AudioPassthruPrivate::processTimer()
 		b_need_to_start_thread = TRUE;
 	else if (hProcessingThread_ == INVALID_HANDLE_VALUE)
 	{
-		// Playback device was unavailable on the last attempt. Retry when a device change has been
-		// seen since that attempt started, or periodically as a fallback. Without the fallback a
-		// Bluetooth headset that becomes usable without sending another notification left FxSound
-		// silent until the user changed output by hand or restarted the app.
-		if (s_sndDevices_.stopRequestGeneration != reinit_generation_ ||
-			!s_sndDevices_.playbackDeviceIsUnavailable ||
-			(GetTickCount() - parked_since_ticks_) >= DFXG_PARKED_RETRY_INTERVAL_MSECS)
+		// Playback device was unavailable on the last attempt. Retry straight away when a device
+		// change has been seen since that attempt started, otherwise after a backed-off interval.
+		// Without the timed retry a Bluetooth headset that becomes usable without sending another
+		// notification left FxSound silent until the user changed output by hand or restarted.
+		BOOL device_changed = (s_sndDevices_.stopRequestGeneration != reinit_generation_) ||
+			!s_sndDevices_.playbackDeviceIsUnavailable;
+
+		if (device_changed)
 		{
+			parked_retry_interval_msecs_ = DFXG_PARKED_RETRY_MIN_INTERVAL_MSECS;
+			hProcessingThread_ = NULL;
+			b_need_to_start_thread = TRUE;
+		}
+		else if ((GetTickCount() - parked_since_ticks_) >= parked_retry_interval_msecs_)
+		{
+			parked_retry_interval_msecs_ *= 2;
+			if (parked_retry_interval_msecs_ > DFXG_PARKED_RETRY_MAX_INTERVAL_MSECS)
+				parked_retry_interval_msecs_ = DFXG_PARKED_RETRY_MAX_INTERVAL_MSECS;
 			hProcessingThread_ = NULL;
 			b_need_to_start_thread = TRUE;
 		}
@@ -481,6 +496,7 @@ int AudioPassthruPrivate::processTimer()
 		if ((numRealDevices > 0) && (DfxDeviceEnabledFlag == IS_TRUE))
 		{
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
+			parked_retry_interval_msecs_ = DFXG_PARKED_RETRY_MIN_INTERVAL_MSECS;
 		}
 		else
 		{
