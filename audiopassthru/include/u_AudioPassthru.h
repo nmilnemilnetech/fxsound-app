@@ -71,5 +71,11 @@ private:
 	bool mute_;
 	DfxDsp *p_dfx_dsp_;
 	static AudioPassthruCallback *s_callback_;
+
+	// Snapshot of s_sndDevices_.stopRequestGeneration taken when the last reinit started. If the
+	// counter has moved on since, a device callback asked for a restart while reinit was running;
+	// that request is otherwise lost because reinit and start-capture both reset the stop flag.
+	long reinit_generation_;
+	DWORD parked_since_ticks_;   // GetTickCount() when processing was parked as unavailable
 };
 

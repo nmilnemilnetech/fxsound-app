@@ -403,6 +403,7 @@ struct sndDevicesHdlType {
 	int bufferSizeMilliSecs;		// This is the average delay, actual internal buffers are twice this length.
 	//int playback_has_started;
 	int stopAudioCaptureAndPlaybackLoop;
+	volatile LONG stopRequestGeneration;	// Incremented by device callbacks each time they request a stop; never reset.
 	int dfxDeviceNum;	// The combo 44.1k and 48k hz. DFX device
 	//int dfx48DeviceNum;	// The 48k hz. DFX device
 	int defaultDeviceNum;

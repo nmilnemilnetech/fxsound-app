@@ -34,6 +34,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 sndDevicesHdlType AudioPassthruPrivate::s_sndDevices_;
 AudioPassthruCallback* AudioPassthruPrivate::s_callback_ = nullptr;
 
+// While processing is parked because the playback device was unavailable, retry this often
+// even if no further device notification arrives. Bluetooth endpoints in particular report
+// ACTIVE before their stream can actually be opened, and may send no further event once ready.
+#define DFXG_PARKED_RETRY_INTERVAL_MSECS 2000
+
 AudioPassthruPrivate::AudioPassthruPrivate()
 {
 	hp_sndDevices_ = (PT_HANDLE *)&(s_sndDevices_);
@@ -44,6 +49,9 @@ AudioPassthruPrivate::AudioPassthruPrivate()
 	swprintf(wcp_playback_device_guid_, PT_MAX_GENERIC_STRLEN, L"");
 	b_no_valid_snd_device_dialog_shown_ = false;
 	debug_ = IS_TRUE;
+	mute_ = false;
+	reinit_generation_ = 0;
+	parked_since_ticks_ = 0;
 }
 
 AudioPassthruPrivate::~AudioPassthruPrivate()
@@ -243,6 +251,8 @@ int AudioPassthruPrivate::sndDeviceHandleToSoundDevices(bool active_devices)
 void AudioPassthruPrivate::onDeviceChange()
 {
 	// Clear the unavailability flag so processTimer() can retry after this device change.
+	// Note this can race with a reinit in progress setting it again; processTimer() also
+	// retries on stopRequestGeneration changes and on a timer, so that race is no longer fatal.
 	s_sndDevices_.playbackDeviceIsUnavailable = FALSE;
 
 	if (s_callback_ != nullptr)
@@ -376,10 +386,17 @@ int AudioPassthruPrivate::processTimer()
 		b_need_to_start_thread = TRUE;
 	else if (hProcessingThread_ == INVALID_HANDLE_VALUE)
 	{
-		// Playback device was unavailable on the last attempt. Wait for onDeviceChange() to
-		// clear playbackDeviceIsUnavailable before retrying, to avoid hammering sndDevicesReInit.
-		if (!s_sndDevices_.playbackDeviceIsUnavailable)
-			hProcessingThread_ = NULL;  // flag cleared — allow retry on next tick
+		// Playback device was unavailable on the last attempt. Retry when a device change has been
+		// seen since that attempt started, or periodically as a fallback. Without the fallback a
+		// Bluetooth headset that becomes usable without sending another notification left FxSound
+		// silent until the user changed output by hand or restarted the app.
+		if (s_sndDevices_.stopRequestGeneration != reinit_generation_ ||
+			!s_sndDevices_.playbackDeviceIsUnavailable ||
+			(GetTickCount() - parked_since_ticks_) >= DFXG_PARKED_RETRY_INTERVAL_MSECS)
+		{
+			hProcessingThread_ = NULL;
+			b_need_to_start_thread = TRUE;
+		}
 	}
 	else
 	{
@@ -390,12 +407,23 @@ int AudioPassthruPrivate::processTimer()
 			CloseHandle(hProcessingThread_);
 			hProcessingThread_ = NULL;
 		}
+		else if (s_sndDevices_.stopRequestGeneration != reinit_generation_)
+		{
+			// A device notification arrived after the running thread's reinit began. Its stop
+			// request may have been wiped when capture started, so ask the thread to restart
+			// now; it exits and the next tick reinitialises against the current devices.
+			s_sndDevices_.stopAudioCaptureAndPlaybackLoop = 1;
+			reinit_generation_ = s_sndDevices_.stopRequestGeneration;
+		}
 	}
 
 	if (b_need_to_start_thread)
 	{
 		/* Initialize flag which can be set by the outside telling thread to end */
 		i_kill_processing_thread_ = IS_FALSE;
+
+		/* Snapshot before reinit: notifications from here on will trigger another pass. */
+		reinit_generation_ = s_sndDevices_.stopRequestGeneration;
 
 		/* Reinit the sndDevices module */
 		if (sndDevicesReInit(hp_sndDevices_, SND_DEVICES_INIT_FOR_PROCESSING, &numRealDevices, &DfxDeviceEnabledFlag, &statusFlag) != OKAY)
@@ -458,6 +486,7 @@ int AudioPassthruPrivate::processTimer()
 			if ((numRealDevices <= 0) || (DfxDeviceEnabledFlag != IS_TRUE))
 				s_sndDevices_.playbackDeviceIsUnavailable = TRUE;
 			hProcessingThread_ = INVALID_HANDLE_VALUE;
+			parked_since_ticks_ = GetTickCount();
 		}
 
 		if (s_callback_ != nullptr)
