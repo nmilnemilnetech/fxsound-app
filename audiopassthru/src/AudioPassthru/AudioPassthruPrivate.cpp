@@ -34,6 +34,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 sndDevicesHdlType AudioPassthruPrivate::s_sndDevices_;
 AudioPassthruCallback* AudioPassthruPrivate::s_callback_ = nullptr;
 
+// While processing is parked because the playback device was unavailable, retry even if no
+// further device notification arrives: Bluetooth endpoints in particular report ACTIVE before
+// their stream can actually be opened, and may send no further event once ready. The interval
+// starts short and doubles on each fruitless retry up to the maximum, so a device that stays
+// away (e.g. a headset switched off for hours) costs one reinit a minute rather than reviving
+// the reinit storm fixed for #580. A device change resets it to the minimum.
+#define DFXG_PARKED_RETRY_MIN_INTERVAL_MSECS 2000
+#define DFXG_PARKED_RETRY_MAX_INTERVAL_MSECS 60000
+
 AudioPassthruPrivate::AudioPassthruPrivate()
 {
 	hp_sndDevices_ = (PT_HANDLE *)&(s_sndDevices_);
@@ -44,6 +53,10 @@ AudioPassthruPrivate::AudioPassthruPrivate()
 	swprintf(wcp_playback_device_guid_, PT_MAX_GENERIC_STRLEN, L"");
 	b_no_valid_snd_device_dialog_shown_ = false;
 	debug_ = IS_TRUE;
+	mute_ = false;
+	reinit_generation_ = 0;
+	parked_since_ticks_ = 0;
+	parked_retry_interval_msecs_ = DFXG_PARKED_RETRY_MIN_INTERVAL_MSECS;
 }
 
 AudioPassthruPrivate::~AudioPassthruPrivate()
@@ -239,6 +252,8 @@ int AudioPassthruPrivate::sndDeviceHandleToSoundDevices(bool active_devices)
 void AudioPassthruPrivate::onDeviceChange()
 {
 	// Clear the unavailability flag so processTimer() can retry after this device change.
+	// Note this can race with a reinit in progress setting it again; processTimer() also
+	// retries on stopRequestGeneration changes and on a timer, so that race is no longer fatal.
 	s_sndDevices_.playbackDeviceIsUnavailable = FALSE;
 
 	if (s_callback_ != nullptr)
@@ -372,10 +387,27 @@ int AudioPassthruPrivate::processTimer()
 		b_need_to_start_thread = TRUE;
 	else if (hProcessingThread_ == INVALID_HANDLE_VALUE)
 	{
-		// Playback device was unavailable on the last attempt. Wait for onDeviceChange() to
-		// clear playbackDeviceIsUnavailable before retrying, to avoid hammering sndDevicesReInit.
-		if (!s_sndDevices_.playbackDeviceIsUnavailable)
-			hProcessingThread_ = NULL;  // flag cleared — allow retry on next tick
+		// Playback device was unavailable on the last attempt. Retry straight away when a device
+		// change has been seen since that attempt started, otherwise after a backed-off interval.
+		// Without the timed retry a Bluetooth headset that becomes usable without sending another
+		// notification left FxSound silent until the user changed output by hand or restarted.
+		BOOL device_changed = (s_sndDevices_.stopRequestGeneration != reinit_generation_) ||
+			!s_sndDevices_.playbackDeviceIsUnavailable;
+
+		if (device_changed)
+		{
+			parked_retry_interval_msecs_ = DFXG_PARKED_RETRY_MIN_INTERVAL_MSECS;
+			hProcessingThread_ = NULL;
+			b_need_to_start_thread = TRUE;
+		}
+		else if ((GetTickCount() - parked_since_ticks_) >= parked_retry_interval_msecs_)
+		{
+			parked_retry_interval_msecs_ *= 2;
+			if (parked_retry_interval_msecs_ > DFXG_PARKED_RETRY_MAX_INTERVAL_MSECS)
+				parked_retry_interval_msecs_ = DFXG_PARKED_RETRY_MAX_INTERVAL_MSECS;
+			hProcessingThread_ = NULL;
+			b_need_to_start_thread = TRUE;
+		}
 	}
 	else
 	{
@@ -386,12 +418,23 @@ int AudioPassthruPrivate::processTimer()
 			CloseHandle(hProcessingThread_);
 			hProcessingThread_ = NULL;
 		}
+		else if (s_sndDevices_.stopRequestGeneration != reinit_generation_)
+		{
+			// A device notification arrived after the running thread's reinit began. Its stop
+			// request may have been wiped when capture started, so ask the thread to restart
+			// now; it exits and the next tick reinitialises against the current devices.
+			s_sndDevices_.stopAudioCaptureAndPlaybackLoop = 1;
+			reinit_generation_ = s_sndDevices_.stopRequestGeneration;
+		}
 	}
 
 	if (b_need_to_start_thread)
 	{
 		/* Initialize flag which can be set by the outside telling thread to end */
 		i_kill_processing_thread_ = IS_FALSE;
+
+		/* Snapshot before reinit: notifications from here on will trigger another pass. */
+		reinit_generation_ = s_sndDevices_.stopRequestGeneration;
 
 		/* Reinit the sndDevices module */
 		if (sndDevicesReInit(hp_sndDevices_, SND_DEVICES_INIT_FOR_PROCESSING, &numRealDevices, &DfxDeviceEnabledFlag, &statusFlag) != OKAY)
@@ -437,6 +480,7 @@ int AudioPassthruPrivate::processTimer()
 		if ((numRealDevices > 0) && (DfxDeviceEnabledFlag == IS_TRUE))
 		{
 			hProcessingThread_ = CreateThread(NULL, 0, processingThread, (LPVOID)this, 0L, &ProcessingThreadID_);
+			parked_retry_interval_msecs_ = DFXG_PARKED_RETRY_MIN_INTERVAL_MSECS;
 		}
 		else
 		{
@@ -454,6 +498,7 @@ int AudioPassthruPrivate::processTimer()
 			if ((numRealDevices <= 0) || (DfxDeviceEnabledFlag != IS_TRUE))
 				s_sndDevices_.playbackDeviceIsUnavailable = TRUE;
 			hProcessingThread_ = INVALID_HANDLE_VALUE;
+			parked_since_ticks_ = GetTickCount();
 		}
 
 		if (s_callback_ != nullptr)

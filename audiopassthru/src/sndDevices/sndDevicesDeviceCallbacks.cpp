@@ -128,6 +128,7 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDefaultDeviceChange
 		//  return(NOT_OKAY);
 
 	  cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	  InterlockedIncrement(&cast_handle->stopRequestGeneration); // lets processTimer() spot a stop request wiped by reinit
   }
 
   // Ignore the notification for the device selected in the application.
@@ -172,6 +173,7 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceAdded(LPCWSTR
 	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceAdded() setting processing thread kill flag");
 
 	  cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	  InterlockedIncrement(&cast_handle->stopRequestGeneration); // lets processTimer() spot a stop request wiped by reinit
   }
 
   if (cast_handle->deviceChangeCallback != NULL)
@@ -197,6 +199,7 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceRemoved(LPCWS
 	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceRemoved() setting processing thread kill flag");
 
 	  cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	  InterlockedIncrement(&cast_handle->stopRequestGeneration); // lets processTimer() spot a stop request wiped by reinit
   }
 
   if (cast_handle->deviceChangeCallback != NULL)
@@ -256,6 +259,7 @@ HRESULT STDMETHODCALLTYPE CsndDevicesMMNotificationClient::OnDeviceStateChanged(
 	  SLOUT_FIRST_LINE(L"CsndDevicesMMNotificationClient::OnDeviceStateChanged() setting processing thread kill flag");
 
 	  cast_handle->stopAudioCaptureAndPlaybackLoop = 1;
+	  InterlockedIncrement(&cast_handle->stopRequestGeneration); // lets processTimer() spot a stop request wiped by reinit
   }
 
   if (cast_handle->deviceChangeCallback != NULL)
